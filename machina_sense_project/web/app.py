@@ -62,7 +62,8 @@ SEG_LEN     = 1024
 # ─── Global State ─────────────────────────────────────────────────────────────
 _state: dict = {
     "ready":            False,
-    "training":         False,
+    "training":         True,
+    "error":            None,
     "model":            None,
     "alert_gen":        None,
     "data_source":      "CWRU Bearing Dataset (Real)",
@@ -147,7 +148,7 @@ def train_model() -> None:
                                 fault_names=sub_df["fault_label"].values, timestamps=timestamps)
         else:
             log.info("CWRU files not found on disk, using synthetic generator fallback.")
-            cwru_df = generate_synthetic_cwru(n_per_class=200)
+            cwru_df = generate_synthetic_cwru(n_per_class=60)
             signals     = list(cwru_df["signal"])
             loads       = cwru_df["load_hp"].values.astype(int)
             labels      = cwru_df["fault_code"].values.astype(int)
@@ -296,9 +297,11 @@ def train_model() -> None:
                  ims_res.get("lead_time_hours") or 60.0)
 
     except Exception:
-        log.error("Training failed with exception:\n%s", traceback.format_exc())
+        err = traceback.format_exc()
+        log.error("Training failed with exception:\n%s", err)
         _state["training"] = False
         _state["ready"]    = False
+        _state["error"]    = err[-600:]
 
 
 # ─── Ottawa Temperature & Load Monitor — Training ─────────────────────────────
@@ -420,6 +423,7 @@ def status():
     return jsonify({
         "ready":       is_ready,
         "training":    _state["training"],
+        "error":       _state.get("error"),
         "data_source": _state.get("data_source", "CWRU Bearing Dataset"),
         "model_info": {
             "type":        "Load-Aware Isolation Forest + NumPy Autoencoder Ensemble",
