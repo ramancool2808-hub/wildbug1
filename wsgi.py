@@ -1,13 +1,13 @@
 """
 wsgi.py - Production WSGI entry point for MachinaSense web app
-Run with: gunicorn wsgi:app --bind 0.0.0.0:5000 --workers 1
+Run with: gunicorn wsgi:app --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 120
 Or dev:   python web/app.py
 """
 import sys
 import threading
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from web.app import app, train_model, train_ottawa_model
 
