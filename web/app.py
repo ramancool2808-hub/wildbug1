@@ -23,6 +23,7 @@ import time
 import logging
 import threading
 import traceback
+import re
 from pathlib import Path
 
 # Allow imports from project root
@@ -62,7 +63,8 @@ SEG_LEN     = 1024
 # ─── Global State ─────────────────────────────────────────────────────────────
 _state: dict = {
     "ready":            False,
-    "training":         False,
+    "training":         True,
+    "error":            None,
     "model":            None,
     "alert_gen":        None,
     "data_source":      "CWRU Bearing Dataset (Real)",
@@ -147,7 +149,7 @@ def train_model() -> None:
                                 fault_names=sub_df["fault_label"].values, timestamps=timestamps)
         else:
             log.info("CWRU files not found on disk, using synthetic generator fallback.")
-            cwru_df = generate_synthetic_cwru(n_per_class=200)
+            cwru_df = generate_synthetic_cwru(n_per_class=60)
             signals     = list(cwru_df["signal"])
             loads       = cwru_df["load_hp"].values.astype(int)
             labels      = cwru_df["fault_code"].values.astype(int)
@@ -296,9 +298,11 @@ def train_model() -> None:
                  ims_res.get("lead_time_hours") or 60.0)
 
     except Exception:
-        log.error("Training failed with exception:\n%s", traceback.format_exc())
+        err = traceback.format_exc()
+        log.error("Training failed with exception:\n%s", err)
         _state["training"] = False
         _state["ready"]    = False
+        _state["error"]    = err[-600:]
 
 
 # ─── Ottawa Temperature & Load Monitor — Training ─────────────────────────────
@@ -420,6 +424,7 @@ def status():
     return jsonify({
         "ready":       is_ready,
         "training":    _state["training"],
+        "error":       _state.get("error"),
         "data_source": _state.get("data_source", "CWRU Bearing Dataset"),
         "model_info": {
             "type":        "Load-Aware Isolation Forest + NumPy Autoencoder Ensemble",
@@ -1306,6 +1311,1085 @@ def temp_monitor_summary():
             "high":     OTTAWA_TEMP_HIGH,
         },
     })
+
+
+# ─── AI Chatbot ───────────────────────────────────────────────────────────────
+
+_CHATBOT_SYSTEM_PROMPT = """You are MachinaSense AI — a bilingual (English + Hindi) expert assistant embedded in the MachinaSense Industrial Fault Detection & Predictive Maintenance platform.
+
+PLATFORM OVERVIEW:
+MachinaSense detects bearing faults in industrial rotating machines WITHOUT needing fault history. It trains only on normal/healthy vibration data (unsupervised) and flags anomalies in real time. Designed for small factories & MSMEs in India.
+
+KEY METRICS: F1=0.9697, AUC=1.0, Recall=1.0, Early-warning lead time=60 hours (NASA IMS), False alarm rate on load shifts=0%, Latency<2ms, RAM=142KB.
+
+ELECTRICAL MACHINE FAULT KNOWLEDGE:
+- Bearing Inner Race Fault (BPFI): Caused by fatigue spalling on inner ring. Detected via BPFI harmonic (~162 Hz at 0HP, 1797 RPM). Symptoms: High kurtosis, elevated envelope energy at BPFI. Cause: Overload, poor lubrication, misalignment. Action: Replace bearing within 5–7 days.
+- Bearing Outer Race Fault (BPFO): Spalling on stationary outer ring. BPFO harmonic ~107 Hz at 0HP. Symptoms: Repetitive impulses, BPFO sidebands. Cause: Contamination, overloading. Action: Controlled replacement.
+- Ball Element Fault (BSF): Rolling element pitting. BSF ~141 Hz at 0HP. Symptoms: BSF modulation, amplitude modulation. Cause: Lubrication failure, surface fatigue. Action: Inspect and replace.
+- Shaft Imbalance: 1× shaft frequency dominance. Cause: Mass imbalance, blade loss, coupling misalignment. Action: Dynamic balancing.
+- Bearing Cage Fault: Cage guidance failure, irregular impulses. Action: Immediate shutdown if worsening.
+- Electrical Faults (induction motors): Rotor eccentricity → sidebands at (f_supply ± k×f_rotor). Stator winding faults → odd harmonics (3f, 5f). Broken rotor bars → upper/lower sidebands at (1±2s)×f_s. Detectable via current signature analysis (MCSA).
+- Misalignment: Angular or parallel. Causes 2× shaft frequency and axial vibration.
+- Looseness (mechanical): Sub-harmonics at 0.5×, 1.5× running speed, multiple harmonics.
+- Resonance: Natural frequency excitation. Broad-band vibration amplification.
+
+DASHBOARD PAGES & HOW TO NAVIGATE:
+1. Dashboard (page: dashboard) — Main health KPIs. Go here first.
+2. Live Simulator (page: simulator) — Inject faults in real time, see oscilloscope+FFT live.
+3. CSV Diagnostic (page: upload) — Upload your own vibration .csv file for AI analysis.
+4. Temp & Load Monitor (page: tempload) — Motor temperature trending, overheating detection.
+5. Early Warning IMS (page: timeline) — 60-hour NASA run-to-failure advance warning chart.
+6. Robustness (page: robustness) — Noise & missing-data resilience comparison.
+7. Edge & ROI (page: edge) — ESP32/RPi BOM costs, MSME payback calculator.
+8. Alert Log (page: alerts) — All fault alerts, bilingual EN+HI, filterable.
+9. Performance (page: metrics) — Confusion matrix, per-load F1 breakdown.
+
+HARDWARE BOM: ESP32-S3 = ₹1,150 (5.8ms latency), RPi Zero 2W = ₹2,200 (1.9ms), Siemens SIPLUS = ₹4,50,000+. Full 10-motor factory monitoring < ₹20,000.
+
+MSME ROI: Hardware ₹18,000 for 10 motors. Annual downtime savings ₹3,69,000. Payback ~18 days.
+
+RESPONSE RULES:
+- Always respond in the SAME language the user writes in.
+- If user writes in Hindi/Hinglish → reply in Hindi (Devanagari + simple terms).
+- If user writes in English → reply in English.
+- If user asks for both → give dual response with 🇮🇳 and 🇬🇧 sections.
+- Be conversational, warm, technically precise.
+- When mentioning a page, include the page name in [NAVIGATE:page_id] format so the UI can offer a navigation button.
+- Give step-by-step guidance when user asks how to do something.
+- Use ✅ for good news, ⚠️ for warnings, 🔴 for critical alerts, 📊 for data."""
+
+
+def _detect_lang(text: str) -> str:
+    """Detect if the query is primarily Hindi or English."""
+    hindi_chars = sum(1 for c in text if '\u0900' <= c <= '\u097f')
+    hinglish = re.search(r'\b(kya|hai|nahi|kaise|kab|kahan|meri|mera|batao|bolo|'
+                         r'samajh|machine|motor|fault|vibration|bearing|alarm|ek|do|'
+                         r'theek|problem|galat|sensor|data|help)\b', text.lower())
+    if hindi_chars > 2 or (hinglish and hindi_chars > 0):
+        return 'hi'
+    return 'en'
+
+
+def _build_live_snippet() -> str:
+    """Build a short live-data sentence to append when model is ready."""
+    if not _state.get('ready'):
+        return ""
+    m   = _state.get('metrics', {})
+    ims = _state.get('ims_results', {})
+    alerts = _state.get('alerts', [])
+    crit = sum(1 for a in alerts if a.get('severity') in ('high', 'critical'))
+    return (f"\n\n📡 *Live system: F1={m.get('f1','—')}, AUC={m.get('auc','—')}, "
+            f"lead-time={ims.get('lead_time_hours','—')}h, "
+            f"critical alerts={crit}*")
+
+
+# ── Comprehensive bilingual response library ──────────────────────────────────
+
+_R = {}   # response dict  key → (en_text, hi_text, navigate_page)
+
+_R['greeting'] = (
+    "👋 **Hello! I'm MachinaSense AI** — your bilingual guide for industrial machine health.\n\n"
+    "I can help you with:\n"
+    "⚙️ **Electrical machine faults** — bearing, rotor, stator, imbalance\n"
+    "📊 **Live system status** — F1, AUC, active alerts\n"
+    "🚀 **Navigate the dashboard** — simulator, CSV upload, alert log\n"
+    "💰 **Hardware & ROI** — ₹1,800 per motor vs ₹4.5L enterprise\n"
+    "🌡️ **Temperature monitoring** — overheating detection\n\n"
+    "Ask me anything — in **English or हिंदी**!",
+
+    "👋 **नमस्ते! मैं MachinaSense AI हूँ** — औद्योगिक मशीन स्वास्थ्य के लिए आपका द्विभाषी सहायक।\n\n"
+    "मैं इन विषयों में मदद कर सकता हूँ:\n"
+    "⚙️ **मशीन की खराबियाँ** — बेयरिंग, रोटर, स्टेटर, असंतुलन\n"
+    "📊 **लाइव सिस्टम स्थिति** — F1 स्कोर, अलर्ट\n"
+    "🚀 **डैशबोर्ड नेविगेशन** — सिम्युलेटर, CSV अपलोड, अलर्ट लॉग\n"
+    "💰 **हार्डवेयर और ROI** — ₹1,800 प्रति मोटर\n"
+    "🌡️ **तापमान निगरानी** — ओवरहीटिंग डिटेक्शन\n\n"
+    "**अंग्रेजी या हिंदी में कुछ भी पूछें!**",
+    None
+)
+
+_R['inner_race'] = (
+    "🔴 **Inner Race Fault (BPFI) — Bearing Inner Ring Damage**\n\n"
+    "**What it is:** Fatigue spalling or pitting on the bearing inner raceway.\n\n"
+    "**How detected:**\n"
+    "• Characteristic frequency: **BPFI ≈ 162 Hz** at 0 HP / 1797 RPM\n"
+    "• Formula: BPFI = (N/2) × (1 + Bd/Pd × cosα) × RPM/60\n"
+    "• Symptoms: Sharp impulses, **high kurtosis (>6)**, elevated envelope energy at BPFI harmonics\n\n"
+    "**Root causes:**\n"
+    "• Shaft overloading beyond bearing rating\n"
+    "• Poor lubrication / dry grease\n"
+    "• Shaft misalignment forcing inner ring fatigue\n"
+    "• Assembly error — press-fit over-tightening\n\n"
+    "**Recommended action:**\n"
+    "⚠️ Score 0.50–0.70 → Schedule inspection in **5–7 days**\n"
+    "🔴 Score >0.70 → Replace bearing within **24–48 hours**\n\n"
+    "Try injecting this fault in the **Live Simulator** → [NAVIGATE:simulator]",
+
+    "🔴 **इनर रेस फॉल्ट (BPFI) — बेयरिंग इनर रिंग खराबी**\n\n"
+    "**क्या होता है:** बेयरिंग की अंदरूनी रेसवे पर थकान के कारण छिलन।\n\n"
+    "**कैसे पहचाने:**\n"
+    "• BPFI आवृत्ति: **≈ 162 Hz** (0 HP / 1797 RPM पर)\n"
+    "• लक्षण: तेज़ कंपन झटके, उच्च Kurtosis (>6), BPFI हार्मोनिक्स में ऊर्जा वृद्धि\n\n"
+    "**कारण:**\n"
+    "• अत्यधिक लोड\n"
+    "• खराब या सूखी ग्रीस\n"
+    "• शाफ्ट का गलत संरेखण\n\n"
+    "**क्या करें:**\n"
+    "⚠️ स्कोर 0.50–0.70 → **5–7 दिन** में निरीक्षण कराएं\n"
+    "🔴 स्कोर >0.70 → **24–48 घंटे** में बेयरिंग बदलें\n\n"
+    "लाइव सिम्युलेटर में यह फॉल्ट देखें → [NAVIGATE:simulator]",
+    'simulator'
+)
+
+_R['outer_race'] = (
+    "🔴 **Outer Race Fault (BPFO) — Bearing Outer Ring Damage**\n\n"
+    "**What it is:** Spalling on the stationary outer raceway — the most common bearing failure mode.\n\n"
+    "**How detected:**\n"
+    "• Characteristic frequency: **BPFO ≈ 107 Hz** at 0 HP / 1797 RPM\n"
+    "• Formula: BPFO = (N/2) × (1 − Bd/Pd × cosα) × RPM/60\n"
+    "• Symptoms: Repetitive impulse pattern, BPFO sidebands in FFT, elevated crest factor\n\n"
+    "**Root causes:**\n"
+    "• Contamination (dirt, water ingress)\n"
+    "• Static overload or shock loads\n"
+    "• False brinelling from vibration during transport\n\n"
+    "**Recommended action:**\n"
+    "⚠️ Early stage → Re-seal, add fresh grease, monitor closely\n"
+    "🔴 Advanced → Controlled shutdown + replace within **48 hours**\n\n"
+    "View the FFT spectrum in the **Live Simulator** → [NAVIGATE:simulator]",
+
+    "🔴 **आउटर रेस फॉल्ट (BPFO) — बेयरिंग आउटर रिंग खराबी**\n\n"
+    "**क्या होता है:** बाहरी (स्थिर) रेसवे पर छिलन — सबसे आम बेयरिंग विफलता।\n\n"
+    "**कैसे पहचाने:**\n"
+    "• BPFO आवृत्ति: **≈ 107 Hz** (0 HP पर)\n"
+    "• लक्षण: दोहरावदार कंपन झटके, FFT में BPFO साइडबैंड\n\n"
+    "**कारण:**\n"
+    "• गंदगी या पानी का प्रवेश\n"
+    "• अचानक झटकेदार लोड\n"
+    "• परिवहन के दौरान कंपन से नुकसान\n\n"
+    "**क्या करें:**\n"
+    "⚠️ प्रारंभिक अवस्था → सील करें, नई ग्रीस डालें\n"
+    "🔴 उन्नत अवस्था → **48 घंटे** में बेयरिंग बदलें\n\n"
+    "लाइव सिम्युलेटर में FFT देखें → [NAVIGATE:simulator]",
+    'simulator'
+)
+
+_R['ball_fault'] = (
+    "🔴 **Ball Element Fault (BSF) — Rolling Element Damage**\n\n"
+    "**What it is:** Pitting or spalling on the rolling ball/roller elements themselves.\n\n"
+    "**How detected:**\n"
+    "• Characteristic frequency: **BSF ≈ 141 Hz** at 0 HP / 1797 RPM\n"
+    "• Symptoms: Amplitude modulation at BSF, complex sidebands, cage noise\n"
+    "• Often harder to detect early — requires envelope analysis\n\n"
+    "**Root causes:**\n"
+    "• Lubrication starvation (most common)\n"
+    "• Surface fatigue after extended operation\n"
+    "• Electrical fluting from stray currents (VFD drives)\n\n"
+    "**Recommended action:**\n"
+    "⚠️ Re-lubricate immediately and re-inspect in 48h\n"
+    "🔴 If score >0.65 → Replace entire bearing assembly\n"
+    "⚡ If VFD-driven motor → install shaft grounding ring\n\n"
+    "Test in the **Live Simulator** → [NAVIGATE:simulator]",
+
+    "🔴 **बॉल एलिमेंट फॉल्ट (BSF) — रोलिंग एलिमेंट खराबी**\n\n"
+    "**क्या होता है:** बेयरिंग के बॉल/रोलर पर छिलन।\n\n"
+    "**कैसे पहचाने:**\n"
+    "• BSF आवृत्ति: **≈ 141 Hz** (0 HP पर)\n"
+    "• लक्षण: एम्प्लीट्यूड मॉड्यूलेशन, जटिल साइडबैंड, केज शोर\n\n"
+    "**कारण:**\n"
+    "• ग्रीस की कमी (सबसे आम)\n"
+    "• लंबे समय तक चलाने से सतह थकान\n"
+    "• VFD ड्राइव से विद्युत प्रवाह द्वारा नुकसान\n\n"
+    "**क्या करें:**\n"
+    "⚠️ तुरंत पुनः-स्नेहन करें, 48h में पुनः जाँच\n"
+    "🔴 स्कोर >0.65 → पूरा बेयरिंग असेंबली बदलें\n\n"
+    "लाइव सिम्युलेटर में जाँचें → [NAVIGATE:simulator]",
+    'simulator'
+)
+
+_R['imbalance'] = (
+    "⚠️ **Shaft Imbalance / Rotor Unbalance**\n\n"
+    "**What it is:** Unequal mass distribution around the rotating axis.\n\n"
+    "**How detected:**\n"
+    "• Dominant peak at **1× shaft frequency** (e.g. 30 Hz at 1800 RPM)\n"
+    "• High radial vibration in both horizontal & vertical directions\n"
+    "• Vibration increases with speed squared\n\n"
+    "**Types:**\n"
+    "• **Static imbalance** — single heavy spot, affects one plane\n"
+    "• **Dynamic imbalance** — affects two planes, causes rocking\n"
+    "• **Couple imbalance** — pure couple, forces cancel statically but not dynamically\n\n"
+    "**Root causes:**\n"
+    "• Blade/vane loss on fans or impellers\n"
+    "• Uneven material buildup (corrosion, deposits)\n"
+    "• Uneven thermal expansion at startup\n\n"
+    "**Action:** Dynamic balancing in ISO Grade G2.5 for fans/blowers. Inspect for blade loss.",
+
+    "⚠️ **शाफ्ट असंतुलन / रोटर अनबैलेंस**\n\n"
+    "**क्या होता है:** घूमने वाले शाफ्ट पर असमान भार वितरण।\n\n"
+    "**कैसे पहचाने:**\n"
+    "• **1× RPM आवृत्ति** पर प्रमुख चोटी (जैसे 1800 RPM → 30 Hz)\n"
+    "• दोनों दिशाओं में उच्च रेडियल कंपन\n"
+    "• गति बढ़ने पर कंपन तेजी से बढ़ता है\n\n"
+    "**कारण:**\n"
+    "• पंखे का ब्लेड टूटना\n"
+    "• असमान घिसाव या जमाव\n\n"
+    "**उपाय:** ISO Grade G2.5 के अनुसार डायनेमिक बैलेंसिंग करवाएं।",
+    None
+)
+
+_R['misalignment'] = (
+    "⚠️ **Shaft Misalignment**\n\n"
+    "**What it is:** The shaft centerlines of coupled machines are not collinear.\n\n"
+    "**How detected:**\n"
+    "• **Angular misalignment**: High 1× and **2× axial vibration**\n"
+    "• **Parallel misalignment**: High 2× radial vibration, phase difference of ~180° across coupling\n"
+    "• Coupling wear, high bearing temperatures\n\n"
+    "**Types:**\n"
+    "• Parallel (offset) — shaft centerlines parallel but offset\n"
+    "• Angular — shaft centerlines meet at an angle\n"
+    "• Combined — most common in practice\n\n"
+    "**Root causes:**\n"
+    "• Thermal growth during operation (soft foot)\n"
+    "• Incorrect shimming during installation\n"
+    "• Base/bedplate distortion\n\n"
+    "**Action:** Laser alignment to ISO 10816 tolerances. Check soft foot first.",
+
+    "⚠️ **शाफ्ट मिसएलाइनमेंट**\n\n"
+    "**क्या होता है:** जुड़े हुए मशीनों की शाफ्ट केंद्र रेखाएं एक सीध में नहीं होतीं।\n\n"
+    "**कैसे पहचाने:**\n"
+    "• कोणीय मिसएलाइनमेंट → **2× अक्षीय कंपन** अधिक\n"
+    "• समानांतर मिसएलाइनमेंट → **2× रेडियल कंपन** अधिक\n"
+    "• कपलिंग पर जल्दी घिसाव\n\n"
+    "**उपाय:** लेजर अलाइनमेंट (ISO 10816 सहनशीलता के अनुसार)। पहले Soft Foot जाँचें।",
+    None
+)
+
+_R['looseness'] = (
+    "⚠️ **Mechanical Looseness**\n\n"
+    "**What it is:** Loose mechanical connections causing chaotic vibration.\n\n"
+    "**How detected:**\n"
+    "• Multiple harmonics: **0.5×, 1×, 1.5×, 2×, 2.5×…** running speed\n"
+    "• Sub-harmonic peaks (0.5× is classic looseness signature)\n"
+    "• Asymmetric waveform, high phase instability\n\n"
+    "**Types:**\n"
+    "• Type A — Structural/frame looseness (foundation bolts)\n"
+    "• Type B — Rotating looseness (loose bearing in housing)\n"
+    "• Type C — Loose rolling element in race (clearance)\n\n"
+    "**Action:** Torque all foundation bolts, inspect bearing housing fits, check for bearing clearance excess.",
+
+    "⚠️ **मैकेनिकल ढीलापन (Looseness)**\n\n"
+    "**क्या होता है:** ढीले यांत्रिक कनेक्शन से अव्यवस्थित कंपन।\n\n"
+    "**कैसे पहचाने:**\n"
+    "• **0.5×, 1×, 1.5×, 2×** RPM आवृत्तियाँ\n"
+    "• Sub-harmonic चोटियाँ (0.5× क्लासिक ढीलापन संकेत)\n\n"
+    "**उपाय:** सभी बेस बोल्ट कसें, बेयरिंग हाउसिंग फिट जाँचें।",
+    None
+)
+
+_R['rotor_bar'] = (
+    "⚡ **Broken Rotor Bar Fault (Induction Motor)**\n\n"
+    "**What it is:** One or more rotor bars crack or break due to thermal/mechanical stress.\n\n"
+    "**How detected (MCSA — Motor Current Signature Analysis):**\n"
+    "• Sidebands at **(1 ± 2s) × f_s** where s = slip, f_s = supply frequency\n"
+    "• At full load (s≈0.03, 50Hz): sidebands at **47 Hz** and **53 Hz**\n"
+    "• Vibration at **2× slip frequency** (typically 3–6 Hz)\n"
+    "• Torque pulsations causing speed fluctuation\n\n"
+    "**Root causes:**\n"
+    "• Frequent starts / reversals (thermal fatigue)\n"
+    "• Manufacturing defects in rotor casting\n"
+    "• Operating above nameplate current\n\n"
+    "**Severity:** 1 bar broken → monitor; 2+ bars → plan rewinding; 3+ bars → shut down\n\n"
+    "**Action:** Current spectrum analysis + thermography. Do not run at partial load if rotor bars suspected.",
+
+    "⚡ **टूटे रोटर बार फॉल्ट (इंडक्शन मोटर)**\n\n"
+    "**क्या होता है:** रोटर के बार (छड़) थर्मल/मैकेनिकल तनाव से टूट जाते हैं।\n\n"
+    "**कैसे पहचाने (MCSA):**\n"
+    "• **(1 ± 2s) × f_s** पर साइडबैंड (जहाँ s = स्लिप, f_s = 50Hz)\n"
+    "• पूर्ण लोड पर: **47 Hz** और **53 Hz** पर साइडबैंड\n"
+    "• टॉर्क स्पंदन, गति में उतार-चढ़ाव\n\n"
+    "**उपाय:** करंट स्पेक्ट्रम विश्लेषण + थर्मोग्राफी। 2+ बार टूटने पर रिवाइंडिंग की योजना बनाएं।",
+    None
+)
+
+_R['stator_fault'] = (
+    "⚡ **Stator Winding Fault (Turn-to-Turn Short)**\n\n"
+    "**What it is:** Inter-turn short circuits in stator winding insulation.\n\n"
+    "**How detected:**\n"
+    "• Odd harmonics in current spectrum: **3×, 5×, 7× f_s** elevated\n"
+    "• Asymmetric phase currents (>5% imbalance)\n"
+    "• Elevated winding temperature in affected phase\n"
+    "• Partial discharge activity\n\n"
+    "**Root causes:**\n"
+    "• Insulation aging (thermal degradation Class B/F/H)\n"
+    "• Voltage spikes from VFD drives (dV/dt)\n"
+    "• Moisture ingress / contamination\n"
+    "• Overloading causing thermal breakdown\n\n"
+    "**Action:**\n"
+    "⚠️ <5% current imbalance → monitor, reduce load\n"
+    "🔴 >10% imbalance or smoke → immediate shutdown, rewind\n"
+    "Install dV/dt filters if running on VFD.",
+
+    "⚡ **स्टेटर वाइंडिंग फॉल्ट (टर्न-टू-टर्न शॉर्ट)**\n\n"
+    "**क्या होता है:** स्टेटर कॉइल की इन्सुलेशन में शॉर्ट सर्किट।\n\n"
+    "**कैसे पहचाने:**\n"
+    "• करंट में **3×, 5×, 7× f_s** हार्मोनिक्स बढ़ना\n"
+    "• फेज करंट असंतुलन (>5%)\n"
+    "• प्रभावित वाइंडिंग का तापमान बढ़ना\n\n"
+    "**उपाय:**\n"
+    "⚠️ करंट असंतुलन <5% → निगरानी, लोड कम करें\n"
+    "🔴 >10% असंतुलन या धुआं → तुरंत बंद करें, रिवाइंड करवाएं",
+    None
+)
+
+_R['eccentricity'] = (
+    "⚡ **Rotor Eccentricity (Air-Gap Variation)**\n\n"
+    "**What it is:** The rotor is not centred in the stator bore, causing variable air gap.\n\n"
+    "**Types:**\n"
+    "• **Static eccentricity** — fixed minimum air-gap position\n"
+    "• **Dynamic eccentricity** — rotor whirl, minimum air-gap rotates\n"
+    "• **Mixed eccentricity** — combination (most common in practice)\n\n"
+    "**How detected:**\n"
+    "• Current spectrum: sidebands at **f_s ± k × f_r** (k=1,2,3…)\n"
+    "• Vibration at 1× and 2× rotor frequency\n"
+    "• Uneven radial magnetic forces → UMP (Unbalanced Magnetic Pull)\n\n"
+    "**Root causes:**\n"
+    "• Worn or loose bearings allowing shaft deflection\n"
+    "• Machining errors in rotor/stator\n"
+    "• Shaft bow due to thermal gradient\n\n"
+    "**Action:** Laser alignment, bearing replacement, dynamic balancing. UMP can cause catastrophic failure if >20% eccentricity.",
+
+    "⚡ **रोटर एक्सेंट्रिसिटी (एयर-गैप भिन्नता)**\n\n"
+    "**क्या होता है:** रोटर स्टेटर बोर में केन्द्रित नहीं होता।\n\n"
+    "**कैसे पहचाने:**\n"
+    "• करंट में **f_s ± k × f_r** पर साइडबैंड\n"
+    "• असंतुलित चुंबकीय खिंचाव (UMP)\n\n"
+    "**उपाय:** लेजर अलाइनमेंट, बेयरिंग बदलना, डायनेमिक बैलेंसिंग।",
+    None
+)
+
+_R['performance'] = (
+    "📊 **MachinaSense Performance — Real CWRU Test Results**\n\n"
+    "| Metric | Result |\n"
+    "|---|---|\n"
+    "| F1 Detection Score | **0.9697** |\n"
+    "| AUC-ROC | **1.0000** |\n"
+    "| Recall (no missed faults) | **1.0000** |\n"
+    "| False alarms on load shifts | **0.0%** |\n"
+    "| Early warning lead time | **60 hours** (NASA IMS) |\n"
+    "| F1 delta at 15 dB noise | −0.020 |\n"
+    "| F1 delta at 10% missing data | −0.011 |\n"
+    "| Inference latency | < **2 ms** |\n"
+    "| Inference RAM | **142 KB** |\n\n"
+    "✅ Tested on **real CWRU bearing data** with zero data leakage.\n"
+    "View full metrics → [NAVIGATE:metrics]",
+
+    "📊 **MachinaSense प्रदर्शन — वास्तविक CWRU परीक्षण परिणाम**\n\n"
+    "| मेट्रिक | परिणाम |\n"
+    "|---|---|\n"
+    "| F1 स्कोर | **0.9697** |\n"
+    "| AUC-ROC | **1.0000** |\n"
+    "| Recall | **1.0000** |\n"
+    "| लोड शिफ्ट पर झूठे अलर्ट | **0.0%** |\n"
+    "| पूर्व चेतावनी | **60 घंटे** पहले |\n"
+    "| अनुमान विलंबता | < **2 ms** |\n\n"
+    "✅ वास्तविक CWRU बेयरिंग डेटा पर परीक्षित।\n"
+    "पूरे मेट्रिक्स देखें → [NAVIGATE:metrics]",
+    'metrics'
+)
+
+_R['hardware'] = (
+    "💰 **Edge Hardware & BOM Costs**\n\n"
+    "| Platform | BOM Cost | Latency | RAM Used |\n"
+    "|---|---|---|---|\n"
+    "| ESP32-S3 (micro-node) | **₹1,150** | 5.8 ms | 84 KB |\n"
+    "| Raspberry Pi Zero 2 W | **₹2,200** | 1.9 ms | 12.8 MB |\n"
+    "| Siemens SIPLUS CMS | **₹4,50,000+** | ~500 ms | 512 MB |\n"
+    "| Augury SaaS | **₹2,50,000/yr** | Minutes | Cloud |\n\n"
+    "✅ MachinaSense runs at **<1% of enterprise competitor cost**.\n"
+    "Full 10-motor factory coverage under **₹20,000** total.\n\n"
+    "See live benchmark → [NAVIGATE:edge]",
+
+    "💰 **एज हार्डवेयर और BOM लागत**\n\n"
+    "| प्लेटफॉर्म | लागत | विलंबता |\n"
+    "|---|---|---|\n"
+    "| ESP32-S3 | **₹1,150** | 5.8 ms |\n"
+    "| Raspberry Pi Zero 2 W | **₹2,200** | 1.9 ms |\n"
+    "| Siemens SIPLUS | **₹4,50,000+** | ~500 ms |\n\n"
+    "✅ MachinaSense प्रतिस्पर्धियों की तुलना में **1% से भी कम लागत** पर काम करता है।\n\n"
+    "लाइव बेंचमार्क देखें → [NAVIGATE:edge]",
+    'edge'
+)
+
+_R['roi'] = (
+    "📈 **MSME ROI & Payback Calculator**\n\n"
+    "For a typical **10-motor small factory** (₹25,000/hr downtime, 18 hrs/yr unplanned stops):\n\n"
+    "| Item | Amount |\n"
+    "|---|---|\n"
+    "| Hardware investment (10 motors) | ₹18,000 |\n"
+    "| Annual unplanned downtime loss | ₹4,50,000 |\n"
+    "| Prevented loss (82% reduction) | ₹3,69,000 |\n"
+    "| Net annual benefit | **₹3,51,000** |\n"
+    "| **Payback period** | **~18 days** |\n\n"
+    "🧮 Calculate your own payback → [NAVIGATE:edge]",
+
+    "📈 **MSME ROI और पेबैक कैलकुलेटर**\n\n"
+    "एक सामान्य **10-मोटर छोटी फैक्ट्री** के लिए (₹25,000/घंटा डाउनटाइम, 18 घंटे/वर्ष):\n\n"
+    "| मद | राशि |\n"
+    "|---|---|\n"
+    "| हार्डवेयर निवेश (10 मोटर) | ₹18,000 |\n"
+    "| वार्षिक डाउनटाइम हानि | ₹4,50,000 |\n"
+    "| बची हुई हानि (82% रोकथाम) | ₹3,69,000 |\n"
+    "| शुद्ध वार्षिक लाभ | **₹3,51,000** |\n"
+    "| **पेबैक अवधि** | **~18 दिन** |\n\n"
+    "अपना पेबैक कैलकुलेट करें → [NAVIGATE:edge]",
+    'edge'
+)
+
+_R['simulator_guide'] = (
+    "🚀 **How to Use the Live Simulator**\n\n"
+    "**Step 1:** Click **Live Simulator** in the sidebar → [NAVIGATE:simulator]\n"
+    "**Step 2:** Click **▶ Start Telemetry Stream** to begin\n"
+    "**Step 3:** Watch the **oscilloscope** and **FFT spectrum** update live\n\n"
+    "**Inject a fault:**\n"
+    "• Click **⚠ Inner Race (BPFI)** — AI score jumps above 0.45\n"
+    "• Click **⚠ Outer Race (BPFO)** — repetitive impulse pattern appears\n"
+    "• Click **⚠ Ball Element (BSF)** — amplitude modulation visible in FFT\n\n"
+    "**Test robustness:**\n"
+    "• Toggle **Sensor Noise (15 dB)** — watch F1 drop only −0.02\n"
+    "• Toggle **Missing Samples (5%)** — imputation handles it automatically\n"
+    "• Click **⚡ Trigger Load Shift Transient** — 5-step suppression prevents false alarm!\n\n"
+    "**Read the gauge:** Speedometer shows health. Green=Normal, Yellow=Watch, Red=Fault.",
+
+    "🚀 **लाइव सिम्युलेटर कैसे उपयोग करें**\n\n"
+    "**चरण 1:** साइडबार में **Live Simulator** पर क्लिक करें → [NAVIGATE:simulator]\n"
+    "**चरण 2:** **▶ Start Telemetry Stream** पर क्लिक करें\n"
+    "**चरण 3:** ऑसिलोस्कोप और FFT स्पेक्ट्रम को लाइव देखें\n\n"
+    "**फॉल्ट इंजेक्ट करें:**\n"
+    "• **⚠ Inner Race (BPFI)** — AI स्कोर 0.45 से ऊपर जाएगा\n"
+    "• **⚠ Outer Race (BPFO)** — FFT में BPFO हार्मोनिक्स दिखेंगे\n"
+    "• **⚠ Ball Element (BSF)** — एम्प्लीट्यूड मॉड्यूलेशन दिखेगा\n\n"
+    "**लोड शिफ्ट टेस्ट:** ⚡ बटन दबाएं → 5-चरण दमन झूठे अलर्ट को रोकेगा!",
+    'simulator'
+)
+
+_R['csv_guide'] = (
+    "📂 **CSV Diagnostic — Upload Your Own Data**\n\n"
+    "**Step 1:** Go to **CSV Diagnostic** → [NAVIGATE:upload]\n"
+    "**Step 2:** Click **📂 Browse** and select your `.csv` file\n"
+    "**Step 3:** Choose motor load (0, 1, 2, or 3 HP)\n"
+    "**Step 4:** Click **⚡ Run Diagnostic** — AI analyzes every window\n\n"
+    "**What your CSV needs:**\n"
+    "• One column of vibration readings (g or m/s² units)\n"
+    "• Minimum 64 data points\n"
+    "• Headers optional — auto-detected\n"
+    "• Sample rate flexible — any kHz\n\n"
+    "**What you get back:**\n"
+    "• 🎯 Risk level: Normal / Low / Warning / High / Critical\n"
+    "• 📊 Anomaly score timeline across all windows\n"
+    "• 🌐 Bilingual report in English + हिंदी\n"
+    "• 🔬 Top feature deviations (evidence chips)\n"
+    "• 📈 FFT spectrum of worst segment",
+
+    "📂 **CSV डायग्नोस्टिक — अपना डेटा अपलोड करें**\n\n"
+    "**चरण 1:** **CSV Diagnostic** पर जाएं → [NAVIGATE:upload]\n"
+    "**चरण 2:** **📂 Browse** से `.csv` फ़ाइल चुनें\n"
+    "**चरण 3:** मोटर लोड चुनें (0, 1, 2, या 3 HP)\n"
+    "**चरण 4:** **⚡ Run Diagnostic** — AI हर विंडो का विश्लेषण करेगा\n\n"
+    "**आपकी CSV फ़ाइल में क्या होना चाहिए:**\n"
+    "• कंपन माप का एक कॉलम (g या m/s² इकाई)\n"
+    "• न्यूनतम 64 डेटा पॉइंट\n"
+    "• हेडर वैकल्पिक\n\n"
+    "**आपको क्या मिलेगा:**\n"
+    "• जोखिम स्तर: सामान्य / कम / चेतावनी / उच्च / गंभीर\n"
+    "• अंग्रेजी + हिंदी में द्विभाषी रिपोर्ट\n"
+    "• FFT स्पेक्ट्रम और फीचर विचलन",
+    'upload'
+)
+
+_R['alerts_guide'] = (
+    "⚠️ **Alert Log & Severity Levels**\n\n"
+    "The Alert Log shows all fault events with 5 severity levels:\n\n"
+    "| Severity | Score Range | Action Required |\n"
+    "|---|---|---|\n"
+    "| ✅ Normal | < 0.35 | No action — healthy |\n"
+    "| 🔵 Low | 0.35–0.50 | Re-inspect in 48–72 hrs |\n"
+    "| 🟡 Medium | 0.50–0.70 | Schedule maintenance in 5–7 days |\n"
+    "| 🟠 High | 0.70–0.85 | Replace bearing within 24–48 hrs |\n"
+    "| 🔴 Critical | > 0.85 | **HALT MACHINE IMMEDIATELY** |\n\n"
+    "Each alert includes:\n"
+    "• Physical fault hypothesis (BPFI/BPFO/BSF)\n"
+    "• Top 5 σ-deviation feature evidence chips\n"
+    "• English + हिंदी bilingual description\n\n"
+    "View alerts → [NAVIGATE:alerts]",
+
+    "⚠️ **अलर्ट लॉग और गंभीरता स्तर**\n\n"
+    "अलर्ट लॉग में 5 गंभीरता स्तर हैं:\n\n"
+    "| गंभीरता | स्कोर | आवश्यक कार्रवाई |\n"
+    "|---|---|---|\n"
+    "| ✅ सामान्य | < 0.35 | कुछ नहीं — स्वस्थ |\n"
+    "| 🔵 कम | 0.35–0.50 | 48–72 घंटे में पुनः जाँच |\n"
+    "| 🟡 मध्यम | 0.50–0.70 | 5–7 दिन में रखरखाव |\n"
+    "| 🟠 उच्च | 0.70–0.85 | 24–48 घंटे में बेयरिंग बदलें |\n"
+    "| 🔴 गंभीर | > 0.85 | **तुरंत मशीन बंद करें** |\n\n"
+    "हर अलर्ट में: फॉल्ट परिकल्पना, शीर्ष 5 फीचर विचलन, अंग्रेजी+हिंदी विवरण।\n\n"
+    "अलर्ट देखें → [NAVIGATE:alerts]",
+    'alerts'
+)
+
+_R['temperature'] = (
+    "🌡️ **Temperature & Load Monitor (Ottawa Model)**\n\n"
+    "**What it monitors:** Motor winding/bearing temperature fused with vibration anomaly score.\n\n"
+    "| Temperature | Status | Action |\n"
+    "|---|---|---|\n"
+    "| < 45°C | ✅ Normal | Continue operation |\n"
+    "| 45–65°C | 🟡 Elevated | Check cooling, reduce load |\n"
+    "| 65–80°C | 🟠 High Alert | Inspect immediately |\n"
+    "| > 80°C | 🔴 Critical | **Shutdown — risk of insulation damage** |\n\n"
+    "**Temperature causes faults:**\n"
+    "• Overheating accelerates bearing grease degradation\n"
+    "• Each 10°C above rated temp halves insulation life (Arrhenius law)\n"
+    "• Thermal cycling causes winding fatigue\n\n"
+    "Monitor live → [NAVIGATE:tempload]",
+
+    "🌡️ **तापमान और लोड मॉनिटर (Ottawa मॉडल)**\n\n"
+    "| तापमान | स्थिति | कार्रवाई |\n"
+    "|---|---|---|\n"
+    "| < 45°C | ✅ सामान्य | चालू रखें |\n"
+    "| 45–65°C | 🟡 बढ़ा हुआ | कूलिंग जाँचें |\n"
+    "| 65–80°C | 🟠 उच्च अलर्ट | तुरंत निरीक्षण |\n"
+    "| > 80°C | 🔴 गंभीर | **तुरंत बंद करें** |\n\n"
+    "**याद रखें:** रेटेड तापमान से हर 10°C अधिक होने पर इन्सुलेशन जीवन **आधा** हो जाता है।\n\n"
+    "लाइव मॉनिटर करें → [NAVIGATE:tempload]",
+    'tempload'
+)
+
+_R['model_arch'] = (
+    "🤖 **MachinaSense AI Architecture**\n\n"
+    "**Ensemble:** Load-Aware Isolation Forest + NumPy Autoencoder\n\n"
+    "**Why unsupervised?** Most small factories have **no historical fault data**. MachinaSense learns what *normal* looks like and flags deviations — works from Day 1.\n\n"
+    "**24-Feature Pipeline:**\n"
+    "• Time-domain: RMS, Peak, Kurtosis, Crest Factor, Skewness, Variance\n"
+    "• Frequency-domain: FFT band energies, BPFI/BPFO/BSF harmonic power\n"
+    "• Envelope: Hilbert transform demodulation, bearing defect frequency energy\n\n"
+    "**Load-Awareness:** 4 separate sub-detectors for 0, 1, 2, 3 HP — prevents false alarms when motor load changes.\n\n"
+    "**Transient Suppression:** 5-step settling window after any load shift.\n\n"
+    "**Dataset:** 16 real CWRU .mat files at 12 kHz. 70% healthy for training. Test = 30% healthy + 100% faults.",
+
+    "🤖 **MachinaSense AI आर्किटेक्चर**\n\n"
+    "**एन्सेम्बल:** Load-Aware Isolation Forest + NumPy Autoencoder\n\n"
+    "**असुपरवाइज़्ड क्यों?** अधिकांश छोटी फैक्ट्रियों के पास **पुरानी फॉल्ट डेटा नहीं होती**। MachinaSense सीखता है कि 'सामान्य' क्या है और विचलन को फ्लैग करता है — Day 1 से काम करता है।\n\n"
+    "**24-फीचर पाइपलाइन:**\n"
+    "• टाइम-डोमेन: RMS, पीक, Kurtosis, क्रेस्ट फैक्टर\n"
+    "• फ्रीक्वेंसी-डोमेन: FFT बैंड ऊर्जा, BPFI/BPFO/BSF\n"
+    "• एन्वेलप: Hilbert ट्रांसफॉर्म\n\n"
+    "**लोड-अवेयरनेस:** 0, 1, 2, 3 HP के लिए अलग-अलग सब-मॉडल।",
+    None
+)
+
+_R['early_warning'] = (
+    "⌛ **Early Warning Timeline — NASA IMS Run-to-Failure**\n\n"
+    "**What it shows:** MachinaSense scored bearings from a NASA IMS dataset where machines ran until catastrophic failure.\n\n"
+    "**Result:** Anomaly score begins elevating **60 hours before physical bearing destruction**.\n\n"
+    "**Why this matters for factories:**\n"
+    "• At 60-hour warning: Order replacement bearing, schedule maintenance window\n"
+    "• At 24-hour warning: Prepare shutdown plan, notify supervisor\n"
+    "• At 6-hour warning: Controlled shutdown — avoid unplanned catastrophic failure\n\n"
+    "**vs. Enterprise:** GE Bently Nevada gives ~48h lead time at 50× the cost.\n\n"
+    "View the timeline chart → [NAVIGATE:timeline]",
+
+    "⌛ **पूर्व चेतावनी टाइमलाइन — NASA IMS रन-टू-फेलियर**\n\n"
+    "**क्या दिखाता है:** NASA IMS डेटासेट पर MachinaSense का परीक्षण जहाँ मशीनें पूरी तरह टूटने तक चलाई गईं।\n\n"
+    "**परिणाम:** भौतिक विफलता से **60 घंटे पहले** अनॉमली स्कोर बढ़ना शुरू।\n\n"
+    "**फैक्ट्री के लिए महत्व:**\n"
+    "• 60-घंटे की चेतावनी पर: बदलने वाली बेयरिंग ऑर्डर करें\n"
+    "• 24-घंटे पर: शटडाउन की योजना बनाएं\n"
+    "• 6-घंटे पर: नियंत्रित शटडाउन करें\n\n"
+    "टाइमलाइन चार्ट देखें → [NAVIGATE:timeline]",
+    'timeline'
+)
+
+_R['about'] = (
+    "🏭 **What is MachinaSense?**\n\n"
+    "MachinaSense is an **edge-first AI predictive maintenance platform** built for India's small factories and MSMEs.\n\n"
+    "**The problem it solves:**\n"
+    "Unexpected motor/bearing failures cost small factories ₹4–50 lakhs/year in unplanned downtime. Enterprise solutions (Siemens, GE) cost ₹4.5L+ per machine — unaffordable for MSMEs.\n\n"
+    "**MachinaSense solution:**\n"
+    "✅ **₹1,800** per motor node (10-motor shop = ₹18,000 total)\n"
+    "✅ **60-hour** advance failure warning\n"
+    "✅ **No fault history** needed — starts monitoring Day 1\n"
+    "✅ Runs **offline on ESP32-S3** — no internet/cloud required\n"
+    "✅ **Bilingual alerts** in English + हिंदी\n"
+    "✅ **~18-day payback** for typical MSME\n\n"
+    "Explore the dashboard → [NAVIGATE:dashboard]",
+
+    "🏭 **MachinaSense क्या है?**\n\n"
+    "MachinaSense भारत की छोटी फैक्ट्रियों और MSME के लिए बनाया गया **एज-फर्स्ट AI प्रेडिक्टिव मेंटेनेंस प्लेटफॉर्म** है।\n\n"
+    "**यह क्या समस्या हल करता है:**\n"
+    "अचानक मोटर/बेयरिंग विफलता से छोटी फैक्ट्रियों को ₹4–50 लाख/वर्ष का नुकसान। Siemens/GE जैसे समाधान ₹4.5 लाख+ प्रति मशीन — MSME के लिए बहुत महंगे।\n\n"
+    "**MachinaSense समाधान:**\n"
+    "✅ **₹1,800** प्रति मोटर नोड\n"
+    "✅ **60 घंटे** पहले विफलता चेतावनी\n"
+    "✅ **फॉल्ट इतिहास नहीं** चाहिए — Day 1 से काम शुरू\n"
+    "✅ **ऑफलाइन** ESP32-S3 पर — इंटरनेट की जरूरत नहीं\n"
+    "✅ **हिंदी + अंग्रेजी** में अलर्ट\n"
+    "✅ **~18 दिन** में पेबैक\n\n"
+    "डैशबोर्ड देखें → [NAVIGATE:dashboard]",
+    'dashboard'
+)
+
+_R['live_status'] = (None, None, None)   # handled dynamically
+
+_R['kurtosis'] = (
+    "📐 **Kurtosis in Vibration Analysis**\n\n"
+    "**What it is:** A statistical measure of how 'peaky' or impulsive a vibration signal is. High kurtosis = sharp impulses.\n\n"
+    "| Kurtosis Value | Interpretation |\n"
+    "|---|---|\n"
+    "| **~3** | Normal Gaussian — healthy bearing |\n"
+    "| **3–6** | Early degradation starting |\n"
+    "| **6–10** | Clear bearing fault present |\n"
+    "| **> 10** | Severe damage — imminent failure |\n\n"
+    "**Why kurtosis is powerful:**\n"
+    "• Insensitive to background vibration level\n"
+    "• Detects even very early-stage impulse faults\n"
+    "• Peaks when bearing first starts producing impacts\n"
+    "• **Paradox:** Can actually *decrease* in very late-stage damage when the signal becomes broad-band noise\n\n"
+    "MachinaSense uses kurtosis as one of its 24 features. A kurtosis spike >6 typically triggers a **Medium** alert.",
+
+    "📐 **Kurtosis (कंपन विश्लेषण में)**\n\n"
+    "**क्या है:** यह मापता है कि कंपन संकेत कितना 'आवेगीय' है। उच्च Kurtosis = तेज झटके।\n\n"
+    "| Kurtosis मान | अर्थ |\n"
+    "|---|---|\n"
+    "| **~3** | सामान्य — स्वस्थ बेयरिंग |\n"
+    "| **3–6** | प्रारंभिक क्षरण |\n"
+    "| **6–10** | स्पष्ट बेयरिंग दोष |\n"
+    "| **> 10** | गंभीर क्षति — जल्द विफलता |\n\n"
+    "MachinaSense इसे अपने 24 फीचर में से एक के रूप में उपयोग करता है।",
+    None
+)
+
+_R['fft'] = (
+    "📡 **FFT (Fast Fourier Transform) in Fault Detection**\n\n"
+    "**What it does:** Converts a time-domain vibration signal into frequency components — reveals which frequencies carry the most energy.\n\n"
+    "**Why it matters for bearing faults:**\n"
+    "Each bearing fault type has a **characteristic defect frequency** (BPFI, BPFO, BSF). When a fault develops, energy peaks appear at those specific frequencies in the FFT.\n\n"
+    "**What to look for:**\n"
+    "| Pattern | Fault Indicated |\n"
+    "|---|---|\n"
+    "| Peak at BPFI (162 Hz) | Inner race fault |\n"
+    "| Peak at BPFO (107 Hz) | Outer race fault |\n"
+    "| Peak at BSF (141 Hz) | Ball fault |\n"
+    "| 1× dominant peak | Imbalance |\n"
+    "| 2× dominant peak | Misalignment |\n"
+    "| Multiple harmonics + sub-harmonics | Mechanical looseness |\n\n"
+    "See the live FFT in **Live Simulator** → [NAVIGATE:simulator]",
+
+    "📡 **FFT (फास्ट फूरियर ट्रांसफॉर्म) — फॉल्ट डिटेक्शन में**\n\n"
+    "**क्या करता है:** टाइम-डोमेन कंपन संकेत को आवृत्ति घटकों में बदलता है।\n\n"
+    "**बेयरिंग फॉल्ट के लिए:**\n"
+    "| पैटर्न | फॉल्ट |\n"
+    "|---|---|\n"
+    "| BPFI (162 Hz) पर चोटी | इनर रेस |\n"
+    "| BPFO (107 Hz) पर चोटी | आउटर रेस |\n"
+    "| BSF (141 Hz) पर चोटी | बॉल |\n"
+    "| 1× प्रमुख चोटी | असंतुलन |\n"
+    "| 2× प्रमुख चोटी | मिसएलाइनमेंट |\n\n"
+    "लाइव FFT देखें → [NAVIGATE:simulator]",
+    'simulator'
+)
+
+_R['rms'] = (
+    "📐 **RMS (Root Mean Square) Vibration**\n\n"
+    "**What it is:** The overall energy level of a vibration signal. The most basic health indicator.\n\n"
+    "**Formula:** RMS = √(Σx²/N)\n\n"
+    "**Typical values (ISO 10816 for motors):**\n"
+    "| RMS (mm/s) | Class I (<15 kW) | Class II (15–75 kW) |\n"
+    "|---|---|---|\n"
+    "| < 0.71 | Zone A (New) | Zone A |\n"
+    "| 0.71–1.8 | Zone B (Good) | Zone A |\n"
+    "| 1.8–4.5 | Zone C (Alarm) | Zone B |\n"
+    "| > 4.5 | Zone D (Danger) | Zone C/D |\n\n"
+    "**Limitation:** RMS alone misses early bearing faults. MachinaSense combines RMS with kurtosis, envelope analysis, and 21 other features for comprehensive detection.",
+
+    "📐 **RMS (रूट मीन स्क्वेयर) कंपन**\n\n"
+    "**क्या है:** कंपन संकेत का समग्र ऊर्जा स्तर।\n\n"
+    "**ISO 10816 मानक (मोटर के लिए):**\n"
+    "| RMS (mm/s) | स्थिति |\n"
+    "|---|---|\n"
+    "| < 0.71 | Zone A — नई मशीन |\n"
+    "| 0.71–1.8 | Zone B — अच्छी |\n"
+    "| 1.8–4.5 | Zone C — अलार्म |\n"
+    "| > 4.5 | Zone D — खतरा |\n\n"
+    "**सीमा:** अकेला RMS प्रारंभिक बेयरिंग फॉल्ट चूक सकता है। MachinaSense 24 फीचर मिलाकर व्यापक पहचान करता है।",
+    None
+)
+
+_R['cwru'] = (
+    "🎓 **CWRU Bearing Dataset**\n\n"
+    "The **Case Western Reserve University (CWRU)** bearing dataset is the gold standard benchmark for vibration fault detection research.\n\n"
+    "**Dataset details:**\n"
+    "• Accelerometer data at **12 kHz** sampling rate\n"
+    "• Motor loads: **0, 1, 2, 3 HP** (1797–1730 RPM)\n"
+    "• Fault types: Inner race, outer race, ball — fault sizes 0.007, 0.014, 0.021 inches\n"
+    "• Tested on real bearings with artificially introduced faults using EDM\n"
+    "• **16 .mat files** covering all conditions\n\n"
+    "MachinaSense trains ONLY on the healthy/normal CWRU segments (unsupervised) and achieves **F1=0.9697** on the full test set.",
+
+    "🎓 **CWRU बेयरिंग डेटासेट**\n\n"
+    "**Case Western Reserve University (CWRU)** बेयरिंग डेटासेट कंपन फॉल्ट डिटेक्शन का स्वर्ण मानक है।\n\n"
+    "**विवरण:**\n"
+    "• **12 kHz** नमूना दर\n"
+    "• मोटर लोड: **0, 1, 2, 3 HP**\n"
+    "• फॉल्ट प्रकार: इनर रेस, आउटर रेस, बॉल\n"
+    "• **16 .mat फ़ाइलें**\n\n"
+    "MachinaSense केवल स्वस्थ CWRU सेगमेंट पर प्रशिक्षण लेता है और **F1=0.9697** प्राप्त करता है।",
+    None
+)
+
+_R['rul'] = (
+    "⏳ **RUL — Remaining Useful Life**\n\n"
+    "**What it is:** An estimate of how much longer a machine can operate before a maintenance action is required.\n\n"
+    "**How MachinaSense estimates RUL:**\n"
+    "• Tracks the rolling anomaly score over the last 60 readings\n"
+    "• Fits a linear degradation trend to the score history\n"
+    "• Projects when the score will cross the critical threshold (0.85)\n"
+    "• Accounts for score volatility to give conservative estimates\n\n"
+    "**Interpretation:**\n"
+    "• RUL > 48 hrs → Continue normal operation, schedule inspection\n"
+    "• RUL 6–48 hrs → Plan maintenance window urgently\n"
+    "• RUL < 6 hrs → **Controlled shutdown as soon as possible**\n\n"
+    "The RUL gauge is visible in the **Live Simulator** → [NAVIGATE:simulator]",
+
+    "⏳ **RUL — शेष उपयोगी जीवन**\n\n"
+    "**क्या है:** अनुमान कि मशीन रखरखाव से पहले कितने समय तक चल सकती है।\n\n"
+    "**MachinaSense RUL कैसे अनुमान लगाता है:**\n"
+    "• पिछली 60 रीडिंग पर रोलिंग अनॉमली स्कोर ट्रैक\n"
+    "• गिरावट की प्रवृत्ति से प्रक्षेपण\n\n"
+    "**व्याख्या:**\n"
+    "• RUL > 48 घंटे → सामान्य संचालन जारी रखें\n"
+    "• RUL 6–48 घंटे → तुरंत रखरखाव की योजना\n"
+    "• RUL < 6 घंटे → **जितनी जल्दी हो सके नियंत्रित शटडाउन**\n\n"
+    "RUL गेज लाइव सिम्युलेटर में देखें → [NAVIGATE:simulator]",
+    'simulator'
+)
+
+_R['lubrication'] = (
+    "🛢️ **Bearing Lubrication & Maintenance**\n\n"
+    "Poor lubrication is the **#1 cause** of bearing failure (responsible for ~36% of all bearing failures).\n\n"
+    "**Lubrication failure signs in vibration:**\n"
+    "• Elevated RMS vibration\n"
+    "• High temperature (>65°C for grease-lubricated bearings)\n"
+    "• Increased BSF and ball pass frequencies\n"
+    "• Squealing noise (dry running)\n\n"
+    "**Best practices:**\n"
+    "• Grease volume: Fill only **1/3 to 1/2** of bearing cavity\n"
+    "• Over-greasing is as harmful as under-greasing (traps heat)\n"
+    "• Re-grease interval: Typically every **500–2000 hours** depending on speed and load\n"
+    "• Use NLGI Grade 2 grease for most industrial motors\n"
+    "• Store grease in sealed containers, away from contamination\n\n"
+    "**MachinaSense alert:** A BSF or BPFI alert with elevated temperature is a strong indicator of lubrication failure.",
+
+    "🛢️ **बेयरिंग स्नेहन और रखरखाव**\n\n"
+    "खराब स्नेहन बेयरिंग विफलता का **#1 कारण** है (सभी विफलताओं का ~36%)।\n\n"
+    "**स्नेहन विफलता के संकेत:**\n"
+    "• बढ़ा हुआ RMS कंपन\n"
+    "• उच्च तापमान (>65°C)\n"
+    "• BSF और बॉल पास आवृत्तियों में वृद्धि\n"
+    "• चीखने की आवाज़\n\n"
+    "**सर्वोत्तम अभ्यास:**\n"
+    "• ग्रीस मात्रा: बेयरिंग कैविटी का केवल **1/3 से 1/2** भरें\n"
+    "• अधिक ग्रीस भी उतनी ही हानिकारक है जितनी कम\n"
+    "• पुनः-ग्रीस अंतराल: आमतौर पर **500–2000 घंटे**\n"
+    "• NLGI Grade 2 ग्रीस का उपयोग करें",
+    None
+)
+
+_R['isolation_forest'] = (
+    "🌲 **Isolation Forest — How It Works**\n\n"
+    "Isolation Forest is an unsupervised anomaly detection algorithm that MachinaSense uses as its primary detector.\n\n"
+    "**Core idea:** Anomalies are *rare* and *different* — they are easier to isolate than normal points.\n\n"
+    "**How it works:**\n"
+    "1. Build random decision trees, splitting features at random values\n"
+    "2. Normal points (in dense regions) need many splits to isolate\n"
+    "3. Anomalies (outliers) need very few splits to isolate\n"
+    "4. Anomaly score = average path length across all trees (short = anomalous)\n\n"
+    "**Why it's perfect for MachinaSense:**\n"
+    "• Works without any fault labels (purely unsupervised)\n"
+    "• Computationally very cheap (O(n log n)) — runs on ESP32\n"
+    "• Robust to irrelevant features\n"
+    "• Trained only on normal CWRU data; faults appear as outliers\n\n"
+    "MachinaSense uses **separate Isolation Forests per load (0/1/2/3 HP)** to prevent load changes from causing false alarms.",
+
+    "🌲 **Isolation Forest — कैसे काम करता है**\n\n"
+    "Isolation Forest एक असुपरवाइज़्ड अनॉमली डिटेक्शन एल्गोरिदम है।\n\n"
+    "**मुख्य विचार:** अनॉमलीज़ *दुर्लभ* और *अलग* होती हैं — उन्हें अलग करना आसान है।\n\n"
+    "**कैसे काम करता है:**\n"
+    "1. यादृच्छिक डिसीजन ट्री बनाएं\n"
+    "2. सामान्य बिंदुओं को अलग करने में अधिक विभाजन लगते हैं\n"
+    "3. अनॉमलीज़ को कम विभाजन में अलग किया जा सकता है\n"
+    "4. अनॉमली स्कोर = औसत पथ लंबाई\n\n"
+    "**MachinaSense के लिए क्यों उपयुक्त:**\n"
+    "• फॉल्ट लेबल की जरूरत नहीं\n"
+    "• बहुत हल्का (ESP32 पर चलता है)\n"
+    "• 0/1/2/3 HP के लिए अलग-अलग फॉरेस्ट",
+    None
+)
+
+_R['navigate_page'] = (
+    "🗺️ **Dashboard Navigation Guide**\n\n"
+    "Here's a quick guide to all pages:\n\n"
+    "| Page | Purpose | Best for |\n"
+    "|---|---|---|\n"
+    "| 🏠 Dashboard | Health KPIs & overview | First stop |\n"
+    "| 📡 Live Simulator | Real-time fault injection | Demo & testing |\n"
+    "| 📂 CSV Diagnostic | Analyze your own data | Field diagnosis |\n"
+    "| 🌡️ Temp Monitor | Temperature + vibration | Overheating |\n"
+    "| ⌛ Early Warning | 60h advance failure chart | Risk planning |\n"
+    "| ⛊ Robustness | Noise resilience tests | Validation |\n"
+    "| ⚡ Edge & ROI | Hardware costs + payback | Business case |\n"
+    "| ⚠️ Alert Log | All fault alerts | Operations |\n"
+    "| ◈ Performance | F1, AUC, metrics | Technical review |\n\n"
+    "Click any page name in the sidebar to navigate!",
+
+    "🗺️ **डैशबोर्ड नेविगेशन गाइड**\n\n"
+    "सभी पृष्ठों की त्वरित मार्गदर्शिका:\n\n"
+    "| पृष्ठ | उद्देश्य |\n"
+    "|---|---|\n"
+    "| 🏠 Dashboard | स्वास्थ्य KPI और अवलोकन |\n"
+    "| 📡 Live Simulator | रियल-टाइम फॉल्ट परीक्षण |\n"
+    "| 📂 CSV Diagnostic | अपना डेटा विश्लेषण |\n"
+    "| 🌡️ Temp Monitor | तापमान + कंपन |\n"
+    "| ⌛ Early Warning | 60 घंटे पहले चेतावनी |\n"
+    "| ⚠️ Alert Log | सभी फॉल्ट अलर्ट |\n"
+    "| ◈ Performance | F1, AUC मेट्रिक्स |\n\n"
+    "साइडबार में किसी भी पृष्ठ के नाम पर क्लिक करें!",
+    None
+)
+
+_R['default'] = (
+    "I'm the **MachinaSense AI** — here to help with industrial machine health!\n\n"
+    "I can answer questions about:\n"
+    "⚙️ **Bearing faults** — Inner race, outer race, ball, imbalance, misalignment, looseness\n"
+    "⚡ **Electrical faults** — Rotor bars, stator windings, eccentricity, MCSA\n"
+    "📊 **System metrics** — F1, AUC, lead time, robustness\n"
+    "🚀 **How to use** — simulator, CSV upload, temperature monitor\n"
+    "💰 **ROI & hardware** — ₹1,800/motor, 18-day payback\n"
+    "📐 **Vibration theory** — FFT, kurtosis, RMS, envelope analysis\n\n"
+    "Type your question or pick a topic — **English or हिंदी** both work!",
+
+    "मैं **MachinaSense AI** हूँ — औद्योगिक मशीन स्वास्थ्य के लिए!\n\n"
+    "मैं इन प्रश्नों का उत्तर दे सकता हूँ:\n"
+    "⚙️ **बेयरिंग फॉल्ट** — इनर रेस, आउटर रेस, बॉल, असंतुलन\n"
+    "⚡ **विद्युत फॉल्ट** — रोटर बार, स्टेटर वाइंडिंग\n"
+    "📊 **सिस्टम मेट्रिक्स** — F1, AUC, लीड टाइम\n"
+    "🚀 **उपयोग कैसे करें** — सिम्युलेटर, CSV अपलोड\n"
+    "💰 **ROI और हार्डवेयर** — ₹1,800/मोटर, 18 दिन पेबैक\n\n"
+    "कोई भी प्रश्न पूछें — **अंग्रेजी या हिंदी** में!",
+    None
+)
+
+
+def _score_intents(q: str) -> str:
+    """Score the query against all intents and return best match key."""
+    patterns = {
+        'greeting':      r'\b(hi|hello|hey|namaste|नमस्ते|hola|sup|wassup|good morning|good evening)\b',
+        'inner_race':    r'\b(inner.?race|bpfi|inner.?ring|inner.?bearing|अंदरूनी)\b',
+        'outer_race':    r'\b(outer.?race|bpfo|outer.?ring|outer.?bearing|बाहरी)\b',
+        'ball_fault':    r'\b(ball.?(fault|element|defect|damage)|bsf|rolling.?element|रोलिंग)\b',
+        'imbalance':     r'\b(imbalance|unbalance|असंतुलन|unbalanced|rotor.?balance|dynamic.?balanc)\b',
+        'misalignment':  r'\b(misalign\w*|मिसएलाइनमेंट|angular.?misalign|laser.?align|shaft.?align|coupling.?align|align.?coupling)\b',
+        'looseness':     r'\b(loose(ness)?|ढीलापन|mechanical.?loose|sub.?harmonic|foundation.?bolt)\b',
+        'rotor_bar':     r'\b(rotor.?bar|broken.?bar|रोटर.?बार|mcsa|motor.?current.?sig|slip.?freq)\b',
+        'stator_fault':  r'\b(stator|winding.?(fault|short|fail)|टर्न.?टू.?टर्न|insulation.?(fail|degrad))\b',
+        'eccentricity':  r'\b(eccentr|एक्सेंट्रिसिटी|air.?gap|ump|unbalanced.?magnetic)\b',
+        'performance':   r'\b(f1|auc|accuracy|recall|precision|performance|metric|score|0\.96|0\.97)\b',
+        'hardware':      r'\b(esp32|raspberry.?pi|bom|hardware.?cost|₹1[,.]?[0-9]|rupee|inr|chip|sensor.?node)\b',
+        'roi':           r'\b(roi|payback|saving|msme|return.?invest|downtime.?cost|factory.?cost)\b',
+        'simulator_guide': r'\b(how.*use.*sim|how.*start|simulator|live.?stream|oscilloscope|telemetry|start.?monitor)\b',
+        'csv_guide':     r'\b(csv|upload|my.?data|own.?data|diagnostic|analyze.*file|file.*analyz)\b',
+        'alerts_guide':  r'\b(alert|notification|severity|warning.?level|critical.?level|alarm.?log)\b',
+        'temperature':   r'\b(temp(erature)?|heat|overheating|thermal|celsius|°c|तापमान|ओवरहीटिंग|ottawa)\b',
+        'model_arch':    r'\b(model|architect|algorithm|isolation.?forest|autoencoder|unsupervised|how.?detect|ml|ai.?work)\b',
+        'early_warning': r'\b(early.?warn|lead.?time|advance.?notice|ims|run.?to.?fail|60.?hour)\b',
+        'about':         r'\b(what.?is.?machina|about.?machina|what.?does.?machina|explain.?machina|overview|platform)\b',
+        'live_status':   r'\b(live|current|now|today|status|running|active|real.?time|system.?status)\b',
+        'kurtosis':      r'\b(kurtosis|kurtotic|impulsive|impulse.?factor|crest.?factor)\b',
+        'fft':           r'\b(fft|fourier|frequency.?spectrum|spectral|harmonic.?analysis|freq.?domain)\b',
+        'rms':           r'\b(rms|root.?mean.?square|overall.?vibration|vibration.?level|iso.?10816)\b',
+        'cwru':          r'\b(cwru|case.?western|bearing.?dataset|dataset)\b',
+        'rul':           r'\b(rul|remaining.?useful|life.?prediction|remaining.?life|prognostics)\b',
+        'lubrication':   r'\b(lubricat|grease|oil.?level|re.?lube|स्नेहन|ग्रीस|dry.?bearing)\b',
+        'isolation_forest': r'\b(isolation.?forest|random.?tree|anomaly.?algo|how.?isolation)\b',
+        'navigate_page': r'\b(navigate|pages|sections|tour|guide.?me|show.?me|where|dashboard.?page)\b',
+        'bearing':       r'\b(bearing|बेयरिंग)\b',   # generic bearing fallthrough
+        'fault':         r'\b(fault|defect|failure|breakdown|खराबी|दोष|विफलता|anomaly|damage)\b',
+    }
+
+    # Generic bearing/fault → route to inner_race as the most detailed
+    for intent, pattern in patterns.items():
+        if re.search(pattern, q, re.IGNORECASE):
+            return intent
+    return 'default'
+
+
+def _rule_based_chatbot(question: str, lang: str = 'en') -> tuple[str, str | None]:
+    """
+    Returns (reply_text, navigate_page_or_None).
+    lang: 'en' | 'hi'
+    """
+    q    = question.lower().strip()
+    intent = _score_intents(q)
+
+    # Live status is dynamic
+    if intent == 'live_status':
+        if _state.get('ready'):
+            m     = _state.get('metrics', {})
+            ims   = _state.get('ims_results', {})
+            alerts = _state.get('alerts', [])
+            crit  = sum(1 for a in alerts if a.get('severity') in ('high', 'critical'))
+            warn  = sum(1 for a in alerts if a.get('severity') == 'medium')
+            if lang == 'hi':
+                reply = (
+                    f"📡 **लाइव सिस्टम स्थिति:**\n\n"
+                    f"| मेट्रिक | मान |\n|---|---|\n"
+                    f"| मॉडल | ✅ तैयार |\n"
+                    f"| डेटा स्रोत | {_state.get('data_source','CWRU')} |\n"
+                    f"| F1 स्कोर | **{m.get('f1','—')}** |\n"
+                    f"| AUC-ROC | **{m.get('auc','—')}** |\n"
+                    f"| लीड टाइम | **{ims.get('lead_time_hours','—')} घंटे** |\n"
+                    f"| प्रशिक्षण नमूने | {_state.get('n_train',0)} |\n"
+                    f"| परीक्षण नमूने | {_state.get('n_test',0)} |\n"
+                    f"| कुल अलर्ट | {len(alerts)} |\n"
+                    f"| गंभीर/उच्च अलर्ट | {crit} |\n"
+                    f"| मध्यम अलर्ट | {warn} |\n\n"
+                    f"Ottawa तापमान मॉडल: {'✅ तैयार' if _state.get('ottawa_ready') else '⏳ प्रशिक्षण जारी...'}"
+                )
+            else:
+                reply = (
+                    f"📡 **Live System Status:**\n\n"
+                    f"| Metric | Value |\n|---|---|\n"
+                    f"| Model | ✅ Ready |\n"
+                    f"| Data Source | {_state.get('data_source','CWRU')} |\n"
+                    f"| F1 Score | **{m.get('f1','—')}** |\n"
+                    f"| AUC-ROC | **{m.get('auc','—')}** |\n"
+                    f"| Lead Time | **{ims.get('lead_time_hours','—')} hrs** |\n"
+                    f"| Train Samples | {_state.get('n_train',0)} |\n"
+                    f"| Test Samples | {_state.get('n_test',0)} |\n"
+                    f"| Total Alerts | {len(alerts)} |\n"
+                    f"| High/Critical | {crit} |\n"
+                    f"| Medium | {warn} |\n\n"
+                    f"Ottawa Temp model: {'✅ Ready' if _state.get('ottawa_ready') else '⏳ Training...'}"
+                )
+            return reply, 'dashboard'
+        else:
+            if lang == 'hi':
+                return ("⏳ मॉडल अभी प्रशिक्षण में है। कृपया लगभग 30 सेकंड प्रतीक्षा करें...", None)
+            return ("⏳ Model is currently training. Please wait ~30 seconds...", None)
+
+    # Generic bearing → inner_race
+    if intent == 'bearing':
+        intent = 'inner_race'
+    # Generic fault → combine inner_race + outer_race summary
+    if intent == 'fault':
+        if lang == 'hi':
+            return (
+                "⚙️ **MachinaSense द्वारा पहचाने जाने वाले फॉल्ट:**\n\n"
+                "| फॉल्ट प्रकार | आवृत्ति | कारण |\n"
+                "|---|---|---|\n"
+                "| इनर रेस (BPFI) | ~162 Hz | अत्यधिक लोड, खराब ग्रीस |\n"
+                "| आउटर रेस (BPFO) | ~107 Hz | गंदगी, झटकेदार लोड |\n"
+                "| बॉल एलिमेंट (BSF) | ~141 Hz | ग्रीस की कमी, थकान |\n"
+                "| शाफ्ट असंतुलन | 1× RPM | ब्लेड टूटना, जमाव |\n"
+                "| मिसएलाइनमेंट | 2× RPM | गलत संरेखण |\n"
+                "| मैकेनिकल ढीलापन | 0.5× से अनेक | ढीले बोल्ट |\n\n"
+                "किसी विशेष फॉल्ट के बारे में जानने के लिए नाम टाइप करें!",
+                'simulator'
+            )
+        return (
+            "⚙️ **Faults Detectable by MachinaSense:**\n\n"
+            "| Fault Type | Frequency | Cause |\n"
+            "|---|---|---|\n"
+            "| Inner Race (BPFI) | ~162 Hz | Overload, poor grease |\n"
+            "| Outer Race (BPFO) | ~107 Hz | Contamination, shock loads |\n"
+            "| Ball Element (BSF) | ~141 Hz | Lube starvation, fatigue |\n"
+            "| Shaft Imbalance | 1× RPM | Blade loss, deposits |\n"
+            "| Misalignment | 2× RPM | Poor coupling alignment |\n"
+            "| Mechanical Looseness | 0.5×+ harmonics | Loose bolts |\n\n"
+            "Ask about any specific fault for detailed guidance!",
+            'simulator'
+        )
+
+    # Look up response
+    entry = _R.get(intent, _R['default'])
+    en_text, hi_text, nav = entry
+    reply = hi_text if (lang == 'hi' and hi_text) else en_text
+    return reply, nav
+
+
+@app.route("/api/chat", methods=["POST"])
+def chat_endpoint():
+    """
+    AI Chatbot endpoint.
+    - Uses OpenAI GPT-4o-mini when OPENAI_API_KEY env var is set.
+    - Falls back to comprehensive bilingual rule-based engine otherwise.
+    Returns: { reply, engine, navigate_page (optional) }
+    """
+    try:
+        body = request.get_json(force=True) or {}
+        messages = body.get("messages", [])
+        if not messages:
+            return jsonify({"error": "No messages provided"}), 400
+
+        # Extract latest user question
+        user_question = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                user_question = msg.get("content", "")
+                break
+
+        # Detect language from the user's message
+        lang = _detect_lang(user_question)
+
+        # ── Try OpenAI if API key is available ────────────────────────────
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if api_key:
+            try:
+                import openai
+                client = openai.OpenAI(api_key=api_key)
+                oai_messages = [{"role": "system", "content": _CHATBOT_SYSTEM_PROMPT}]
+                for msg in messages[-12:]:
+                    if msg.get("role") in ("user", "assistant") and msg.get("content"):
+                        oai_messages.append({"role": msg["role"], "content": msg["content"]})
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=oai_messages,
+                    max_tokens=700,
+                    temperature=0.45,
+                )
+                reply = response.choices[0].message.content.strip()
+                # Extract navigate hint from response if present
+                nav_match = re.search(r'\[NAVIGATE:(\w+)\]', reply)
+                nav_page = nav_match.group(1) if nav_match else None
+                reply_clean = re.sub(r'\[NAVIGATE:\w+\]', '', reply).strip()
+                return jsonify({"reply": reply_clean, "engine": "gpt-4o-mini",
+                                "navigate_page": nav_page})
+            except Exception as e:
+                log.warning("OpenAI call failed (%s), falling back to rule-based engine.", e)
+
+        # ── Rule-based bilingual engine ────────────────────────────────────
+        reply_text, nav_page = _rule_based_chatbot(user_question, lang)
+
+        # Strip [NAVIGATE:xxx] markers from the displayed text
+        reply_clean = re.sub(r'\[NAVIGATE:\w+\]', '', reply_text).strip()
+
+        return jsonify({
+            "reply":         reply_clean,
+            "engine":        "MachinaSense AI (rule-based)",
+            "navigate_page": nav_page,
+            "lang":          lang,
+        })
+
+    except Exception:
+        log.error("Chat endpoint error:\n%s", traceback.format_exc())
+        return jsonify({"error": "Chat service temporarily unavailable."}), 500
 
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
