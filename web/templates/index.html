@@ -985,7 +985,77 @@
   </div>
 </div>
 
+<!-- ─── AI Chatbot Widget — MUST be before script tags ───────────────────── -->
+<!-- Floating Action Button -->
+<button id="chatbot-fab" title="Ask MachinaSense AI" aria-label="Open AI Assistant">
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+  </svg>
+  <span class="chat-notif-dot"></span>
+</button>
+
+<!-- Chat Panel -->
+<div id="chatbot-panel" class="chat-hidden" role="dialog" aria-label="MachinaSense AI Chat">
+  <!-- Header -->
+  <div class="chat-header">
+    <div class="chat-header-icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/>
+        <path d="M19 8h1a2 2 0 0 1 2 2v1a2 2 0 0 1-2 2h-1"/>
+        <path d="M5 8H4a2 2 0 0 0-2 2v1a2 2 0 0 0 2 2h1"/>
+      </svg>
+    </div>
+    <div class="chat-header-text">
+      <div class="chat-header-title">MachinaSense AI</div>
+      <div class="chat-header-sub" id="chat-header-sub">Industrial Fault Expert • EN / हिंदी</div>
+    </div>
+    <div class="chat-lang-toggle" title="Toggle language">
+      <button class="chat-lang-btn active" id="chat-lang-en" data-lang="en">EN</button>
+      <button class="chat-lang-btn" id="chat-lang-hi" data-lang="hi">हिं</button>
+    </div>
+    <div class="chat-header-status" title="Online"></div>
+    <button id="chat-close-btn" aria-label="Close chat">✕</button>
+  </div>
+  <!-- Message Area -->
+  <div id="chat-messages" role="log" aria-live="polite"></div>
+  <!-- Nav banner -->
+  <div id="chat-nav-banner" style="display:none">
+    <span id="chat-nav-text">Go to this page?</span>
+    <button id="chat-nav-btn" class="chat-nav-go-btn">&#8594; Open</button>
+    <button id="chat-nav-dismiss" class="chat-nav-dismiss-btn">&#10005;</button>
+  </div>
+  <!-- Quick chips -->
+  <div class="chat-quick-btns" id="chat-quick-btns">
+    <button class="chat-quick-btn" data-q="What is MachinaSense?">&#x1F3ED; Overview</button>
+    <button class="chat-quick-btn" data-q="What faults can be detected?">&#x2699; Fault types</button>
+    <button class="chat-quick-btn" data-q="What is inner race fault BPFI?">Inner race</button>
+    <button class="chat-quick-btn" data-q="Explain outer race fault BPFO">Outer race</button>
+    <button class="chat-quick-btn" data-q="What is stator winding fault?">Stator fault</button>
+    <button class="chat-quick-btn" data-q="Explain broken rotor bar fault">Rotor bar</button>
+    <button class="chat-quick-btn" data-q="What is shaft imbalance?">Imbalance</button>
+    <button class="chat-quick-btn" data-q="What are the performance metrics?">Metrics</button>
+    <button class="chat-quick-btn" data-q="What is the hardware cost?">Hardware cost</button>
+    <button class="chat-quick-btn" data-q="How do I use the live simulator?">Simulator</button>
+    <button class="chat-quick-btn" data-q="How do I upload a CSV file?">CSV upload</button>
+    <button class="chat-quick-btn" data-q="What is the current live system status?">Live status</button>
+    <button class="chat-quick-btn" data-q="What is kurtosis in vibration analysis?">Kurtosis</button>
+    <button class="chat-quick-btn" data-q="What is FFT and how is it used?">FFT</button>
+    <button class="chat-quick-btn" data-q="What is the MSME ROI and payback?">ROI</button>
+    <button class="chat-quick-btn" data-q="&#x092E;&#x0936;&#x0940;&#x0928; &#x0915;&#x0940; &#x062E;&#x0930;&#x093E;&#x092C;&#x0940; &#x0915;&#x0947; &#x092C;&#x093E;&#x0930;&#x0947; &#x092E;&#x0947;&#x0902; &#x092C;&#x0924;&#x093E;&#x090F;&#x0902;">Hindi</button>
+  </div>
+  <!-- Input Row -->
+  <div class="chat-input-row">
+    <textarea id="chat-input" placeholder="Ask in English or Hindi..." rows="1" autocomplete="off" spellcheck="false"></textarea>
+    <button id="chat-send-btn" aria-label="Send">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>
+      </svg>
+    </button>
+  </div>
+</div>
+
 <script src="/static/js/charts.js"></script>
 <script src="/static/js/app.js"></script>
+
 </body>
 </html>
