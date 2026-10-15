@@ -1,18 +1,14 @@
 """
 wsgi.py - Production WSGI entry point for MachinaSense web app
-Run with: gunicorn wsgi:app --bind 0.0.0.0:5000 --workers 1 --threads 4 --timeout 120
+Run with: gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
 Or dev:   python web/app.py
 """
 import sys
-import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from web.app import app, train_model, train_ottawa_model
+from web.app import app, start_training_once   # noqa: E402
 
-# Train on first import (for gunicorn / WSGI servers)
-_t1 = threading.Thread(target=train_model,        daemon=True)
-_t2 = threading.Thread(target=train_ottawa_model, daemon=True)
-_t1.start()
-_t2.start()
+# web.app already starts training on import; this call is a harmless no-op safeguard.
+start_training_once()
