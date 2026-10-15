@@ -1387,3 +1387,373 @@ async function renderTempLoadPage() {
     console.error('TempLoad page load error:', err);
   }
 }
+
+
+// ─── AI Chatbot — MachinaSense Bilingual Industrial Assistant ──────────────
+
+document.addEventListener('DOMContentLoaded', function () {
+(function () {
+  'use strict';
+
+  // ── Element refs ──────────────────────────────────────────────────────────
+  const fab        = document.getElementById('chatbot-fab');
+  const panel      = document.getElementById('chatbot-panel');
+  const closeBtn   = document.getElementById('chat-close-btn');
+  const msgArea    = document.getElementById('chat-messages');
+  const inputEl    = document.getElementById('chat-input');
+  const sendBtn    = document.getElementById('chat-send-btn');
+  const navBanner  = document.getElementById('chat-nav-banner');
+  const navText    = document.getElementById('chat-nav-text');
+  const navGoBtn   = document.getElementById('chat-nav-btn');
+  const navDismiss = document.getElementById('chat-nav-dismiss');
+  const langEnBtn  = document.getElementById('chat-lang-en');
+  const langHiBtn  = document.getElementById('chat-lang-hi');
+  const headerSub  = document.getElementById('chat-header-sub');
+
+  // ── State ─────────────────────────────────────────────────────────────────
+  let isOpen       = false;
+  let isBusy       = false;
+  let hasGreeted   = false;
+  let prefLang     = 'en';       // 'en' | 'hi' — user's preferred language
+  let pendingNav   = null;       // page to navigate to when user clicks banner
+  const history    = [];         // conversation history sent to backend
+
+  // Page label map for the nav banner
+  const PAGE_LABELS = {
+    dashboard:  '🏠 Dashboard',
+    simulator:  '📡 Live Simulator',
+    upload:     '📂 CSV Diagnostic',
+    tempload:   '🌡️ Temp & Load Monitor',
+    timeline:   '⌛ Early Warning',
+    robustness: '⛊ Robustness',
+    edge:       '⚡ Edge & ROI',
+    alerts:     '⚠️ Alert Log',
+    metrics:    '◈ Performance',
+  };
+
+  // ── Language toggle ───────────────────────────────────────────────────────
+  function setLang(lang) {
+    prefLang = lang;
+    langEnBtn.classList.toggle('active', lang === 'en');
+    langHiBtn.classList.toggle('active', lang === 'hi');
+    headerSub.textContent = lang === 'hi'
+      ? 'औद्योगिक दोष विशेषज्ञ • EN / हिंदी'
+      : 'Industrial Fault Expert • EN / हिंदी';
+    inputEl.placeholder = lang === 'hi'
+      ? 'हिंदी में पूछें या Ask in English…'
+      : 'Ask in English or हिंदी में पूछें…';
+  }
+
+  langEnBtn.addEventListener('click', () => setLang('en'));
+  langHiBtn.addEventListener('click', () => setLang('hi'));
+
+  // ── Toggle panel ──────────────────────────────────────────────────────────
+  function openChat() {
+    isOpen = true;
+    panel.classList.remove('chat-hidden');
+    fab.classList.remove('has-notif');
+    fab.setAttribute('aria-expanded', 'true');
+    inputEl.focus();
+    if (!hasGreeted) {
+      hasGreeted = true;
+      // Show greeting based on preferred lang
+      const greetEN = "👋 **Hello! I'm MachinaSense AI** — your bilingual industrial machine health expert.\n\n"
+        + "I can help with:\n"
+        + "⚙️ **Bearing & electrical faults** — BPFI, BPFO, BSF, rotor bars, stator shorts\n"
+        + "📊 **Live system metrics** — F1, AUC, active alerts\n"
+        + "🚀 **Dashboard navigation** — guide you to the right page\n"
+        + "💰 **Hardware & ROI** — ₹1,800/motor, 18-day payback\n\n"
+        + "Type your question — **English or हिंदी** both work! 🇮🇳🇬🇧";
+      const greetHI = "👋 **नमस्ते! मैं MachinaSense AI हूँ** — आपका द्विभाषी औद्योगिक विशेषज्ञ।\n\n"
+        + "मैं इन विषयों में मदद कर सकता हूँ:\n"
+        + "⚙️ **बेयरिंग और विद्युत खराबियाँ** — BPFI, BPFO, BSF, रोटर बार, स्टेटर\n"
+        + "📊 **लाइव मेट्रिक्स** — F1, AUC, सक्रिय अलर्ट\n"
+        + "🚀 **डैशबोर्ड नेविगेशन** — सही पृष्ठ पर मार्गदर्शन\n"
+        + "💰 **हार्डवेयर और ROI** — ₹1,800/मोटर, 18-दिन पेबैक\n\n"
+        + "**English or हिंदी में पूछें!** 🇮🇳🇬🇧";
+      typewriterBotMessage(prefLang === 'hi' ? greetHI : greetEN);
+    }
+  }
+
+  function closeChat() {
+    isOpen = false;
+    panel.classList.add('chat-hidden');
+    fab.setAttribute('aria-expanded', 'false');
+    hideNavBanner();
+  }
+
+  fab.addEventListener('click', () => isOpen ? closeChat() : openChat());
+  closeBtn.addEventListener('click', closeChat);
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && isOpen) closeChat();
+  });
+
+  // ── Quick-chip listeners ───────────────────────────────────────────────────
+  document.querySelectorAll('.chat-quick-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const q = btn.getAttribute('data-q');
+      if (q && !isBusy) {
+        // Auto-switch lang if Hindi chip clicked
+        if (/[\u0900-\u097f]/.test(q)) setLang('hi');
+        sendMessage(q);
+      }
+    });
+  });
+
+  // ── Input handling ────────────────────────────────────────────────────────
+  inputEl.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (!isBusy) doSend();
+    }
+    setTimeout(() => {
+      inputEl.style.height = 'auto';
+      inputEl.style.height = Math.min(inputEl.scrollHeight, 90) + 'px';
+    }, 0);
+  });
+  sendBtn.addEventListener('click', () => { if (!isBusy) doSend(); });
+
+  function doSend() {
+    const text = inputEl.value.trim();
+    if (!text) return;
+    inputEl.value = '';
+    inputEl.style.height = 'auto';
+    // Auto-detect lang from what user typed
+    if (/[\u0900-\u097f]/.test(text)) setLang('hi');
+    sendMessage(text);
+  }
+
+  // ── Navigation banner ─────────────────────────────────────────────────────
+  function showNavBanner(pageId) {
+    const label = PAGE_LABELS[pageId] || pageId;
+    pendingNav = pageId;
+    navText.textContent = (prefLang === 'hi')
+      ? `इस पृष्ठ पर जाएं: ${label}`
+      : `Navigate to: ${label}`;
+    navBanner.style.display = 'flex';
+  }
+
+  function hideNavBanner() {
+    navBanner.style.display = 'none';
+    pendingNav = null;
+  }
+
+  navGoBtn.addEventListener('click', () => {
+    if (!pendingNav) return;
+    // Trigger page switch using the existing app.js nav system
+    const navLink = document.querySelector(`[data-page="${pendingNav}"]`);
+    if (navLink) navLink.click();
+    hideNavBanner();
+    closeChat();
+  });
+  navDismiss.addEventListener('click', hideNavBanner);
+
+  // ── Markdown → HTML renderer ──────────────────────────────────────────────
+  function mdToHtml(text) {
+    let s = text
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    // Tables
+    s = s.replace(/(?:^\|.+\|[ \t]*$\n?)+/gm, match => {
+      const rows = match.trim().split('\n').filter(r => r.trim());
+      let html = '<table>';
+      let headDone = false;
+      rows.forEach((row) => {
+        if (/^\|[\s\-|:]+\|$/.test(row.trim())) { headDone = true; return; }
+        const cells = row.split('|').slice(1, -1).map(c => c.trim());
+        if (!headDone) {
+          html += '<tr>' + cells.map(c => `<th>${c}</th>`).join('') + '</tr>';
+          headDone = true;
+        } else {
+          html += '<tr>' + cells.map(c => `<td>${c}</td>`).join('') + '</tr>';
+        }
+      });
+      return html + '</table>';
+    });
+
+    // Bold / italic / code
+    s = s.replace(/\*\*(.+?)\*\*/gs, '<strong>$1</strong>');
+    s = s.replace(/__(.+?)__/gs, '<strong>$1</strong>');
+    s = s.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+    s = s.replace(/`([^`]+)`/g, '<span class="code">$1</span>');
+
+    // Bullet lists (•, -, *)
+    s = s.replace(/^[•\-\*] (.+)$/gm, '<li>$1</li>');
+    s = s.replace(/((<li>[^]*?<\/li>\n?)+)/g, '<ul>$1</ul>');
+
+    // Numbered lists
+    s = s.replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>');
+
+    // Line breaks
+    s = s.replace(/\n{2,}/g, '<br><br>');
+    s = s.replace(/\n/g, '<br>');
+
+    return s;
+  }
+
+  // ── DOM helpers ───────────────────────────────────────────────────────────
+  function addUserMessage(text) {
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-msg user-msg';
+    wrap.innerHTML = `
+      <div class="chat-avatar user-avatar">You</div>
+      <div class="chat-bubble user-bubble">${mdToHtml(text)}</div>`;
+    msgArea.appendChild(wrap);
+    scrollDown();
+  }
+
+  function showTyping() {
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-msg bot-msg';
+    wrap.id = 'chat-typing-indicator';
+    wrap.innerHTML = `
+      <div class="chat-avatar bot-avatar">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>
+      </div>
+      <div class="chat-typing">
+        <span class="typing-dot"></span><span class="typing-dot"></span><span class="typing-dot"></span>
+      </div>`;
+    msgArea.appendChild(wrap);
+    scrollDown();
+  }
+
+  function removeTyping() {
+    const el = document.getElementById('chat-typing-indicator');
+    if (el) el.remove();
+  }
+
+  function scrollDown() {
+    requestAnimationFrame(() => { msgArea.scrollTop = msgArea.scrollHeight; });
+  }
+
+  function setBusy(v) {
+    isBusy = v;
+    sendBtn.disabled = v;
+    inputEl.disabled = v;
+  }
+
+  // ── Typewriter effect for bot messages ────────────────────────────────────
+  function typewriterBotMessage(text, engine, navPage) {
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-msg bot-msg';
+    const bubbleDiv = document.createElement('div');
+    bubbleDiv.className = 'chat-bubble bot-bubble';
+
+    const avatarSvg = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>`;
+    wrap.innerHTML = `<div class="chat-avatar bot-avatar">${avatarSvg}</div>`;
+    wrap.appendChild(bubbleDiv);
+    if (engine) {
+      const et = document.createElement('div');
+      et.className = 'engine-tag';
+      et.textContent = engine;
+      wrap.appendChild(et);
+    }
+    msgArea.appendChild(wrap);
+    scrollDown();
+
+    // Typewriter — char by char on the rendered HTML would break tags,
+    // so we convert markdown first then type the plain text into innerHTML progressively
+    const htmlContent = mdToHtml(text);
+    // Fast-path: just set innerHTML directly for long responses; animate for short ones
+    const FAST_THRESHOLD = 400; // chars
+    if (text.length > FAST_THRESHOLD) {
+      bubbleDiv.innerHTML = htmlContent;
+      scrollDown();
+    } else {
+      // Animate character by character in the raw text, then set HTML at end
+      let i = 0;
+      const cursor = document.createElement('span');
+      cursor.className = 'chat-cursor';
+      bubbleDiv.appendChild(cursor);
+
+      const chars = text.split('');
+      function tick() {
+        if (i < chars.length) {
+          // Build partial text, convert to HTML, replace cursor
+          const partial = chars.slice(0, i + 1).join('');
+          bubbleDiv.innerHTML = mdToHtml(partial);
+          const cur2 = document.createElement('span');
+          cur2.className = 'chat-cursor';
+          bubbleDiv.appendChild(cur2);
+          i++;
+          scrollDown();
+          // Speed: fast for normal chars, tiny pause after sentence ends
+          const delay = /[.!?।\n]/.test(chars[i - 1]) ? 40 : 12;
+          setTimeout(tick, delay);
+        } else {
+          // Final: set full HTML, remove cursor
+          bubbleDiv.innerHTML = htmlContent;
+          scrollDown();
+          if (navPage) showNavBanner(navPage);
+        }
+      }
+      tick();
+    }
+
+    if (text.length > FAST_THRESHOLD && navPage) {
+      showNavBanner(navPage);
+    }
+    return wrap;
+  }
+
+  // ── Send message ──────────────────────────────────────────────────────────
+  async function sendMessage(text) {
+    if (!text.trim() || isBusy) return;
+    if (!isOpen) openChat();
+    hideNavBanner();
+
+    addUserMessage(text);
+    history.push({ role: 'user', content: text });
+    setBusy(true);
+    showTyping();
+
+    try {
+      const res = await fetch('/api/chat', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ messages: history, lang: prefLang }),
+      });
+
+      removeTyping();
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        typewriterBotMessage('⚠️ Sorry — ' + (err.error || `Server error ${res.status}`));
+        setBusy(false);
+        return;
+      }
+
+      const data     = await res.json();
+      const reply    = data.reply    || '(no response)';
+      const engine   = data.engine   || null;
+      const navPage  = data.navigate_page || null;
+      const respLang = data.lang     || prefLang;
+
+      // Auto-update lang toggle if server detected hindi
+      if (respLang === 'hi' && prefLang !== 'hi') setLang('hi');
+
+      typewriterBotMessage(reply, engine, navPage);
+      history.push({ role: 'assistant', content: reply });
+      if (history.length > 24) history.splice(0, history.length - 24);
+
+    } catch (err) {
+      removeTyping();
+      const offline = prefLang === 'hi'
+        ? '⚠️ नेटवर्क त्रुटि — सर्वर से कनेक्ट नहीं हो सका। Flask सर्वर चल रहा है यह सुनिश्चित करें।'
+        : '⚠️ Network error — could not reach the server. Make sure the Flask server is running.';
+      typewriterBotMessage(offline);
+    } finally {
+      setBusy(false);
+      scrollDown();
+    }
+  }
+
+  // ── Notification dot on FAB ──────────────────────────────────────────────
+  window.addEventListener('load', () => {
+    setTimeout(() => { if (!isOpen) fab.classList.add('has-notif'); }, 4000);
+  });
+
+})(); // end chatbot IIFE
+}); // end DOMContentLoaded
