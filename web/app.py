@@ -99,6 +99,7 @@ _state: dict = {
     "ottawa_conditions":     [],   # list of known condition labels
 }
 _lock = threading.Lock()
+_BOOT_TIME = time.time()
 
 
 def _shaft_freq(load_hp: int) -> float:
@@ -425,6 +426,14 @@ def status():
         "ready":       is_ready,
         "training":    _state["training"],
         "error":       _state.get("error"),
+        "diag": {
+            "pid":             os.getpid(),
+            "uptime_s":        round(time.time() - _BOOT_TIME, 1),
+            "booted_at_utc":   time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(_BOOT_TIME)),
+            "train_threads":   [t.name for t in threading.enumerate() if t.name.startswith("train")],
+            "ottawa_ready":    _state.get("ottawa_ready"),
+            "code_version":    "2026-10-15-diag",
+        },
         "data_source": _state.get("data_source", "CWRU Bearing Dataset"),
         "model_info": {
             "type":        "Load-Aware Isolation Forest + NumPy Autoencoder Ensemble",
