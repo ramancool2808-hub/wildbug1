@@ -2392,12 +2392,29 @@ def chat_endpoint():
         return jsonify({"error": "Chat service temporarily unavailable."}), 500
 
 
+# ─── Start training once, no matter how the app is launched ──────────────────
+_start_lock    = threading.Lock()
+_train_started = False
+
+def start_training_once() -> None:
+    """Start both training threads exactly once per process (safe to call repeatedly)."""
+    global _train_started
+    with _start_lock:
+        if _train_started:
+            return
+        _train_started = True
+    threading.Thread(target=train_model,        daemon=True, name="train-main").start()
+    threading.Thread(target=train_ottawa_model, daemon=True, name="train-ottawa").start()
+    log.info("Training threads started (pid=%s)", os.getpid())
+
+# Runs on import, so `gunicorn wsgi:app`, `gunicorn web.app:app` and
+# `python web/app.py` all end up training the models.
+start_training_once()
+
+
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    t1 = threading.Thread(target=train_model,        daemon=True)
-    t2 = threading.Thread(target=train_ottawa_model, daemon=True)
-    t1.start()
-    t2.start()
+    start_training_once()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
