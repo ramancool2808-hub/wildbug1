@@ -83,34 +83,37 @@ function pollUntilReady() {
   const fill    = document.getElementById('loader-fill');
   const msg     = document.getElementById('loader-msg');
   const overlay = document.getElementById('loading-overlay');
-  const steps   = [
-    'Scanning CWRU dataset files...',
-    'Extracting physical vibration features (RMS, FFT, kurtosis)...',
-    'Fitting load-aware Isolation Forest per HP operating condition...',
-    'Training deep NumPy Autoencoder for gradual drift detection...',
-    'Computing held-out classification metrics & ROC curves...',
-    'Evaluating NASA IMS run-to-failure lead time...',
-    'MachinaSense ready!',
-  ];
-  let stepIdx = 0;
+  const started = Date.now();
 
   const iv = setInterval(async () => {
-    pollProgress = Math.min(pollProgress + 5, 95);
+    pollProgress = Math.min(pollProgress + 2, 95);
     if (fill) fill.style.width = pollProgress + '%';
-    if (msg && stepIdx < steps.length) msg.textContent = steps[stepIdx++];
+    const secs = Math.round((Date.now() - started) / 1000);
+    if (msg) msg.textContent = `Training model on server... ${secs}s (first load can take a minute)`;
 
     try {
       const res  = await fetch(API + '/api/status');
       const data = await res.json();
+      if (data.error) {
+        clearInterval(iv);
+        if (msg) msg.textContent = 'Server training failed: ' + String(data.error).split('\n').slice(-3).join(' ');
+        return;
+      }
       if (data.ready) {
         clearInterval(iv);
         if (fill) fill.style.width = '100%';
         if (msg)  msg.textContent  = 'Model trained & operational!';
         setTimeout(() => overlay && overlay.remove(), 450);
         onModelReady(data);
+        return;
       }
-    } catch (_) { /* still starting */ }
-  }, 600);
+    } catch (_) { /* server waking up */ }
+
+    if (Date.now() - started > 8 * 60 * 1000) {
+      clearInterval(iv);
+      if (msg) msg.textContent = 'Taking too long. Refresh the page or check the server logs.';
+    }
+  }, 1500);
 }
 
 async function onModelReady(statusData) {
